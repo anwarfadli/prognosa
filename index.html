@@ -7039,22 +7039,17 @@ async function processOnlineExcel(){
 
 // Parser Excel buffer menggunakan SheetJS (dimuat on-demand)
 async function parseAndLoadExcelBuffer(buffer, filename){
-  // ── Status helper ─────────────────────────────────────────
   function toast(msg){ showToast(msg,'info',0); }
-
   toast('⏳ Membaca '+filename+'...');
   await new Promise(r=>setTimeout(r,30));
 
   try{
-    // ── Step 1: Index ZIP ──────────────────────────────────
     const zipIdx = indexZip(buffer);
 
-    // ── Step 2: Workbook → daftar sheet ───────────────────
     const wbBuf = await extractFile(zipIdx,'xl/workbook.xml');
-    if(!wbBuf) throw new Error('workbook.xml tidak ditemukan — bukan file Excel yang valid');
+    if(!wbBuf) throw new Error('workbook.xml tidak ditemukan');
     const wbXml = new TextDecoder().decode(wbBuf);
 
-    // Parse sheet list (handle r:id dan tanpa namespace)
     const sheetList=[];
     for(const m of wbXml.matchAll(/<sheet\b[^>]+name="([^"]+)"[^>]+r:id="([^"]+)"/g))
       sheetList.push({name:m[1],rId:m[2]});
@@ -7062,173 +7057,176 @@ async function parseAndLoadExcelBuffer(buffer, filename){
       for(const m of wbXml.matchAll(/<sheet\b[^>]+name="([^"]+)"[^>]+rId="([^"]+)"/g))
         sheetList.push({name:m[1],rId:m[2]});
 
-    // ── Step 3: Rels → path per sheet ─────────────────────
     const relsBuf = await extractFile(zipIdx,'xl/_rels/workbook.xml.rels');
-    const relsXml = relsBuf ? new TextDecoder().decode(relsBuf) : '';
-    const relMap  = {};
+    const relsXml = relsBuf?new TextDecoder().decode(relsBuf):'';
+    const relMap={};
     for(const m of relsXml.matchAll(/Id="([^"]+)"[^>]+Target="([^"]+)"/g))
-      relMap[m[1]] = m[2];
+      relMap[m[1]]=m[2];
 
-    // ── Step 4: Shared strings ─────────────────────────────
     const ssBuf = await extractFile(zipIdx,'xl/sharedStrings.xml');
-    const ssXml = ssBuf ? new TextDecoder().decode(ssBuf) : '';
-    const ss = [];
+    const ssXml = ssBuf?new TextDecoder().decode(ssBuf):'';
+    const ss=[];
     for(const m of ssXml.matchAll(/<si>([\s\S]*?)<\/si>/g))
       ss.push([...m[1].matchAll(/<t[^>]*>([^<]*)<\/t>/g)].map(t=>t[1]).join(''));
 
-    // ── Step 5: Identifikasi sheet tahun yang tersedia ────
-    const yearSheets = sheetList.filter(s=>/^20\d\d$/.test(s.name));
+    // Hanya proses sheet bertahun (2017-2030) — skip sheet lain
+    const yearSheets=sheetList.filter(s=>/^20\d\d$/.test(s.name));
     if(!yearSheets.length) throw new Error(
-      'Sheet bertahun (mis. 2022, 2025) tidak ditemukan.\n'+
-      'Sheet tersedia: '+sheetList.map(s=>s.name).join(', ')
+      'Sheet bertahun tidak ditemukan. Sheet tersedia: '+sheetList.map(s=>s.name).join(', ')
     );
 
-    // ── Step 6: Reset DB kategori ──────────────────────────
     ['pax','acft','cargo'].forEach(catId=>{
       const cat=CATEGORIES.find(cc=>cc.id===catId);
-      if(cat) cat.rows.forEach(r=>{ DB[catId][r.key]={}; });
+      if(cat) cat.rows.forEach(r=>{DB[catId][r.key]={};});
     });
 
-    const loadedYears = [];
+    const loadedYears=[];
 
-    // ── Step 7: Parse per sheet tahun ─────────────────────
     for(const sheet of yearSheets){
-      const yr   = sheet.name;
-      const ynum = parseInt(yr);
-
-      toast('⏳ Memproses sheet '+yr+'...');
+      const yr=sheet.name, ynum=parseInt(yr);
+      toast('⏳ Memproses '+yr+'...');
       await new Promise(r=>setTimeout(r,10));
 
-      const target = relMap[sheet.rId]||'';
-      const path   = 'xl/'+target.replace(/^\.\.\//,'').replace(/^xl\//,'');
-      const shBuf  = await extractFile(zipIdx,path);
-      if(!shBuf){ console.warn('Sheet not found:',path); continue; }
+      const target=relMap[sheet.rId]||'';
+      const path='xl/'+target.replace(/^\.\.\//,'').replace(/^xl\//,'');
+      const shBuf=await extractFile(zipIdx,path);
+      if(!shBuf) continue;
+      const shXml=new TextDecoder().decode(shBuf);
 
-      const shXml  = new TextDecoder().decode(shBuf);
+      // ── Parser cepat: indexOf bukan regex [\s\S]*? ──────────
+      // Regex [\s\S]*? pada XML besar = catastrophic backtracking → hang
+      // indexOf jauh lebih cepat untuk file besar
+      const cells={};
 
-      // Parse XML → cells[rowNum][colLetter]
-      const cells = {};
-      for(const rowM of shXml.matchAll(/<row\b[^>]+r="(\d+)"[^>]*>([\s\S]*?)<\/row>/g)){
-        const rn = parseInt(rowM[1]);
-        cells[rn] = {};
-        for(const cm of rowM[2].matchAll(/<c\b r="([A-Z]+)\d+"([^>]*)>([\s\S]*?)<\/c>/g)){
-          const col=cm[1], attrs=cm[2], content=cm[3];
-          const tm=attrs.match(/t="([^"]*)"/);
-          const vm=content.match(/<v>([^<]*)<\/v>/);
-          const t=tm?tm[1]:'', v=vm?vm[1]:'';
+      let pos=0;
+      while(true){
+        // Cari <row
+        const rowStart = shXml.indexOf('<row', pos);
+        if(rowStart<0) break;
+        // Cari penutup tag <row ...>
+        const rowTagEnd = shXml.indexOf('>', rowStart);
+        if(rowTagEnd<0) break;
+        // Ambil atribut r="N"
+        const rowTag = shXml.slice(rowStart, rowTagEnd+1);
+        const rMatch = rowTag.match(/\br="(\d+)"/);
+        if(!rMatch){ pos=rowTagEnd+1; continue; }
+        const rnum = parseInt(rMatch[1]);
+        // Cari </row>
+        const rowEnd = shXml.indexOf('</row>', rowTagEnd);
+        if(rowEnd<0) break;
+        const rowContent = shXml.slice(rowTagEnd+1, rowEnd);
+        pos = rowEnd+6;
+
+        // Hanya proses row yang relevan (row 4-50 = data per bulan)
+        if(rnum<4||rnum>55){ continue; }
+
+        cells[rnum]={};
+        // Parse cells dalam row ini
+        let cp=0;
+        while(true){
+          const cStart=rowContent.indexOf('<c ',cp);
+          if(cStart<0) break;
+          const cTagEnd=rowContent.indexOf('>',cStart);
+          if(cTagEnd<0) break;
+          const cTag=rowContent.slice(cStart,cTagEnd+1);
+          // Cek apakah self-closing <c ... />
+          if(cTag.endsWith('/>')){cp=cTagEnd+1;continue;}
+          const cEnd=rowContent.indexOf('</c>',cTagEnd);
+          if(cEnd<0) break;
+          const cContent=rowContent.slice(cTagEnd+1,cEnd);
+          cp=cEnd+4;
+
+          // Kolom
+          const refM=cTag.match(/\br="([A-Z]+)\d+"/);
+          if(!refM) continue;
+          const col=refM[1];
+          // Type
+          const tM=cTag.match(/\bt="([^"]*)"/);
+          const t=tM?tM[1]:'';
+          // Value
+          const vStart=cContent.indexOf('<v>');
+          const vEnd=cContent.indexOf('</v>');
+          const v=vStart>=0&&vEnd>vStart?cContent.slice(vStart+3,vEnd):'';
+
           let val=null;
           if(t==='s') val=ss[parseInt(v)]||'';
-          else if(v){const n=parseFloat(v); val=isNaN(n)?v:n;}
-          cells[rn][col]=val;
+          else if(v){const n=parseFloat(v);val=isNaN(n)?v:n;}
+          cells[rnum][col]=val;
         }
       }
 
-      // ── Deteksi format baris per tahun ─────────────────
-      // Format A (2022-2024): setiap bulan = INT → TTL → DOM
-      //   Ciri: baris pertama data = INT
-      // Format B (2025-2026): setiap bulan = DOM → INT → TTL
-      //   Ciri: baris pertama data = DOM
-      const gc = (r,col)=>{ const v=cells[r]&&cells[r][col]; return (v!==null&&v!==undefined)?v:null; };
-      const si = v=>{ const n=parseFloat(v); return (isNaN(n)||n<0)?0:Math.round(n); };
-      const sf = (v,div=1)=>{ const n=parseFloat(v); return (isNaN(n)||n<0)?0:Math.round(n/div*100)/100; };
+      // Deteksi format baris
+      const gc=(r,col)=>{const v=cells[r]&&cells[r][col];return v!==null&&v!==undefined?v:null;};
+      const si=v=>{const n=parseFloat(v);return isNaN(n)||n<0?0:Math.round(n);};
+      const sf=(v,div=1)=>{const n=parseFloat(v);return isNaN(n)||n<0?0:Math.round(n/div*100)/100;};
 
-      // Cari baris awal (row pertama yang B='INT' atau B='DOM')
       let startRow=-1, formatA=false;
-      for(let r=4; r<=15; r++){
-        const b = cells[r]&&cells[r]['B'];
-        if(b==='INT'){ startRow=r; formatA=true; break; }
-        if(b==='DOM'){ startRow=r; formatA=false; break; }
+      for(let r=4;r<=15;r++){
+        const b=cells[r]&&cells[r]['B'];
+        if(b==='INT'){startRow=r;formatA=true;break;}
+        if(b==='DOM'){startRow=r;formatA=false;break;}
       }
-      if(startRow<0){ console.warn('Format tidak dikenali untuk sheet',yr); continue; }
+      if(startRow<0){console.warn('Format tidak dikenali:',yr);continue;}
 
-      // Kargo kolom berdasarkan tahun (dari analisis file nyata)
-      // 2022: Z=kargo_dom (KG, bagi 1000), AA=kargo_brk_dom (KG)
-      // 2023: AC=kargo_dom (ton), AD=kargo_brk_dom (ton)
-      // 2024-2026: Z=kargo_dom (ton), AA=kargo_brk_dom (ton)
-      const cargoDiv   = (yr==='2022') ? 1000 : 1;
-      const cargoDomDtg= (yr==='2023') ? 'AC' : 'Z';
-      const cargoDomBrk= (yr==='2023') ? 'AD' : 'AA';
-      const cargoIntDtg= (yr==='2022') ? 'Z'  : (yr==='2023') ? 'AC' : 'Z';
-      const cargoIntBrk= (yr==='2022') ? 'AA' : (yr==='2023') ? 'AD' : 'AA';
+      const cargoDiv  =(yr==='2022')?1000:1;
+      const cDomDtg   =(yr==='2023')?'AC':'Z';
+      const cDomBrk   =(yr==='2023')?'AD':'AA';
+      const cIntDtg   =(yr==='2022')?'Z':(yr==='2023')?'AC':'Z';
+      const cIntBrk   =(yr==='2022')?'AA':(yr==='2023')?'AD':'AA';
 
-      let mi=0, ri=startRow;
-      const maxRow = startRow + 42; // max 12 bulan × 3 baris + buffer
-
-      while(mi<12 && ri<maxRow){
-        let domR, intR;
-
+      let mi=0,ri=startRow;
+      while(mi<12&&ri<startRow+42){
+        let domR,intR;
         if(formatA){
-          // Format INT→TTL→DOM: ri=INT, ri+1=TTL, ri+2=DOM
-          if(cells[ri]&&cells[ri]['B']!=='INT'){ ri++; continue; }
-          intR=ri; domR=ri+2;
-        } else {
-          // Format DOM→INT→TTL: ri=DOM, ri+1=INT
-          if(cells[ri]&&cells[ri]['B']!=='DOM'){ ri++; continue; }
-          domR=ri; intR=ri+1;
+          if(cells[ri]&&cells[ri]['B']!=='INT'){ri++;continue;}
+          intR=ri;domR=ri+2;
+        }else{
+          if(cells[ri]&&cells[ri]['B']!=='DOM'){ri++;continue;}
+          domR=ri;intR=ri+1;
         }
-
-        // Penumpang — kolom J=DTG, K=BRK, L=Transit
-        DB['pax']['pax_dd'][`${ynum}-${mi}`]    = si(gc(domR,'J'));
-        DB['pax']['pax_bd'][`${ynum}-${mi}`]    = si(gc(domR,'K'));
-        DB['pax']['pax_trs_d'][`${ynum}-${mi}`] = si(gc(domR,'L'));
-        DB['pax']['pax_trf_d'][`${ynum}-${mi}`] = 0;
-        DB['pax']['pax_di'][`${ynum}-${mi}`]    = si(gc(intR,'J'));
-        DB['pax']['pax_bi'][`${ynum}-${mi}`]    = si(gc(intR,'K'));
-        DB['pax']['pax_trs_i'][`${ynum}-${mi}`] = si(gc(intR,'L'));
-        DB['pax']['pax_trf_i'][`${ynum}-${mi}`] = 0;
-
-        // Pesawat — kolom D=DTG, E=BRK (C sering berisi formula, skip)
-        DB['acft']['ac_dd'][`${ynum}-${mi}`] = si(gc(domR,'D'));
-        DB['acft']['ac_bd'][`${ynum}-${mi}`] = si(gc(domR,'E'));
-        DB['acft']['ac_di'][`${ynum}-${mi}`] = si(gc(intR,'D'));
-        DB['acft']['ac_bi'][`${ynum}-${mi}`] = si(gc(intR,'E'));
-
-        // Kargo
-        DB['cargo']['cg_dd'][`${ynum}-${mi}`] = sf(gc(domR,cargoDomDtg),cargoDiv);
-        DB['cargo']['cg_bd'][`${ynum}-${mi}`] = sf(gc(domR,cargoDomBrk),cargoDiv);
-        DB['cargo']['cg_di'][`${ynum}-${mi}`] = sf(gc(intR,cargoIntDtg),cargoDiv);
-        DB['cargo']['cg_bi'][`${ynum}-${mi}`] = sf(gc(intR,cargoIntBrk),cargoDiv);
-
-        mi++;
-        ri += 3; // lompat ke grup bulan berikutnya
+        DB['pax']['pax_dd'][`${ynum}-${mi}`]=si(gc(domR,'J'));
+        DB['pax']['pax_bd'][`${ynum}-${mi}`]=si(gc(domR,'K'));
+        DB['pax']['pax_trs_d'][`${ynum}-${mi}`]=si(gc(domR,'L'));
+        DB['pax']['pax_trf_d'][`${ynum}-${mi}`]=0;
+        DB['pax']['pax_di'][`${ynum}-${mi}`]=si(gc(intR,'J'));
+        DB['pax']['pax_bi'][`${ynum}-${mi}`]=si(gc(intR,'K'));
+        DB['pax']['pax_trs_i'][`${ynum}-${mi}`]=si(gc(intR,'L'));
+        DB['pax']['pax_trf_i'][`${ynum}-${mi}`]=0;
+        DB['acft']['ac_dd'][`${ynum}-${mi}`]=si(gc(domR,'D'));
+        DB['acft']['ac_bd'][`${ynum}-${mi}`]=si(gc(domR,'E'));
+        DB['acft']['ac_di'][`${ynum}-${mi}`]=si(gc(intR,'D'));
+        DB['acft']['ac_bi'][`${ynum}-${mi}`]=si(gc(intR,'E'));
+        DB['cargo']['cg_dd'][`${ynum}-${mi}`]=sf(gc(domR,cDomDtg),cargoDiv);
+        DB['cargo']['cg_bd'][`${ynum}-${mi}`]=sf(gc(domR,cDomBrk),cargoDiv);
+        DB['cargo']['cg_di'][`${ynum}-${mi}`]=sf(gc(intR,cIntDtg),cargoDiv);
+        DB['cargo']['cg_bi'][`${ynum}-${mi}`]=sf(gc(intR,cIntBrk),cargoDiv);
+        mi++;ri+=3;
       }
-
       if(mi>0) loadedYears.push(yr);
-      console.log(`[SIPRAU] Sheet ${yr}: ${mi} bulan, format ${formatA?'INT→TTL→DOM':'DOM→INT→TTL'}`);
+      console.log(`[SIPRAU] ${yr}: ${mi} bulan, format ${formatA?'INT→TTL→DOM':'DOM→INT→TTL'}`);
     }
 
-    if(!loadedYears.length) throw new Error('Tidak ada data yang berhasil dimuat dari sheet manapun');
+    if(!loadedYears.length) throw new Error('Tidak ada data yang berhasil dimuat');
 
-    // ── Step 8: Update UI & render ────────────────────────
-    const minY = Math.min(...loadedYears.map(Number));
-    const maxY = Math.max(...loadedYears.map(Number));
-
-    try{ document.getElementById('startY').value = String(minY); }catch(e){}
-    try{ document.getElementById('endY').value   = String(maxY); }catch(e){}
-    try{
-      document.getElementById('apName').value='Bandara Kualanamu';
-      document.getElementById('apCode').value='WIMM';
-      updateHeader();
-    }catch(e){}
-
-    CATEGORIES.forEach(cc=>{ activeSub[cc.id]='input'; });
+    const minY=Math.min(...loadedYears.map(Number));
+    const maxY=Math.max(...loadedYears.map(Number));
+    try{document.getElementById('startY').value=String(minY);}catch(e){}
+    try{document.getElementById('endY').value=String(maxY);}catch(e){}
+    try{document.getElementById('apName').value='Bandara Kualanamu';}catch(e){}
+    try{document.getElementById('apCode').value='WIMM';updateHeader();}catch(e){}
+    CATEGORIES.forEach(cc=>{activeSub[cc.id]='input';});
     currentPage='pax';
     document.querySelectorAll('.nav-item').forEach(b=>{
       b.classList.toggle('active',(b.getAttribute('onclick')||'').indexOf("showPage('pax'")>=0);
     });
     rebuild();
-
     console.log(`[SIPRAU] Loaded: ${loadedYears.join(', ')}`);
-    console.log('[SIPRAU] DB pax.pax_dd sample:',
-      Object.entries(DB.pax.pax_dd).slice(0,3).map(([k,v])=>k+'='+v).join(', ')
-    );
-
-    showToast(`✓ Data "${filename}" dimuat — ${loadedYears.join(', ')}`, 'success', 5000);
-    showStatus(`Excel: ${filename} | ${loadedYears.join(', ')} | Penumpang · Pesawat · Kargo`, true);
+    showToast(`✓ "${filename}" dimuat — ${loadedYears.join(', ')}`,'success',5000);
+    showStatus(`Excel: ${filename} | ${loadedYears.join(', ')} | Penumpang · Pesawat · Kargo`,true);
 
   }catch(err){
     showToast('✗ '+err.message.split('\n')[0],'error',7000);
-    console.error('[parseAndLoadExcelBuffer]', err);
+    console.error('[parseAndLoadExcelBuffer]',err);
   }
 }
 
