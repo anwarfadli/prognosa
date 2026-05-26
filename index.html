@@ -1084,81 +1084,7 @@ var XLSX; XLSX = window.XLSX = (function(){
     catch(e) { try { return new TextDecoder('latin1').decode(bytes); } catch(e2) { return ''; } }
   }
 
-  // ZIP index: parse Central Directory tapi JANGAN decompress dulu
-  function indexZip(ab) {
-    const dv    = new DataView(ab);
-    const bytes = new Uint8Array(ab);
-    const len   = bytes.length;
-    const index = {}; // fname → {method, cmpSize, uncmpSize, dataStart}
-
-    let eocd = -1;
-    for (let i = len - 22; i >= Math.max(0, len - 65536); i--) {
-      if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
-    }
-    if (eocd < 0) throw new Error('Bukan file ZIP/XLSX yang valid');
-
-    const cdCount  = dv.getUint16(eocd + 8,  true);
-    const cdOffset = dv.getUint32(eocd + 16, true);
-
-    let pos = cdOffset;
-    for (let n = 0; n < cdCount; n++) {
-      if (pos + 46 > len) break;
-      if (dv.getUint32(pos, true) !== 0x02014b50) break;
-
-      const method    = dv.getUint16(pos + 10, true);
-      const cmpSize   = dv.getUint32(pos + 20, true);
-      const uncmpSize = dv.getUint32(pos + 24, true);
-      const fnLen     = dv.getUint16(pos + 28, true);
-      const exLen     = dv.getUint16(pos + 30, true);
-      const cmtLen    = dv.getUint16(pos + 32, true);
-      const lfhOffset = dv.getUint32(pos + 42, true);
-      const name      = new TextDecoder().decode(bytes.slice(pos + 46, pos + 46 + fnLen));
-      pos += 46 + fnLen + exLen + cmtLen;
-
-      if (lfhOffset + 30 > len) continue;
-      const lfhFnLen  = dv.getUint16(lfhOffset + 26, true);
-      const lfhExLen  = dv.getUint16(lfhOffset + 28, true);
-      const dataStart = lfhOffset + 30 + lfhFnLen + lfhExLen;
-
-      index[name] = { method, cmpSize, uncmpSize, dataStart };
-    }
-    return { index, bytes };
-  }
-
-  // Decompress satu file dari index
-  async function extractFile(zipData, fname) {
-    const entry = zipData.index[fname];
-    if (!entry) return null;
-    const { method, cmpSize, dataStart } = entry;
-    const { bytes } = zipData;
-    const cmpData = bytes.slice(dataStart, dataStart + cmpSize);
-
-    if (method === 0) return cmpData;
-    if (method !== 8) return null;
-
-    // Coba DecompressionStream (faster untuk file besar)
-    if (typeof DecompressionStream !== 'undefined') {
-      try {
-        const ds  = new DecompressionStream('deflate-raw');
-        const w   = ds.writable.getWriter();
-        const r   = ds.readable.getReader();
-        await w.write(cmpData);
-        await w.close();
-        const chunks = []; let total = 0;
-        while (true) {
-          const { done, value } = await r.read();
-          if (done) break;
-          chunks.push(value); total += value.length;
-        }
-        const out = new Uint8Array(total); let off = 0;
-        for (const ch of chunks) { out.set(ch, off); off += ch.length; }
-        return out;
-      } catch(e) {}
-    }
-    // Fallback tinyInflate
-    try { return tinyInflate(cmpData); } catch(e) { return new Uint8Array(0); }
-  }
-
+  // indexZip & extractFile dipindah ke global scope
   async function parseZip(ab) {
     // Backward compat: return files object
     const zipData = indexZip(ab);
@@ -1333,6 +1259,83 @@ var XLSX; XLSX = window.XLSX = (function(){
 
   return { read, utils: { sheet_to_json, aoa_to_sheet, book_new, book_append_sheet }, writeFile };
 })();
+
+// ── Global ZIP helpers (dipindah dari XLSX IIFE agar bisa diakses global) ──
+// ZIP index: parse Central Directory tapi JANGAN decompress dulu
+  function indexZip(ab) {
+    const dv    = new DataView(ab);
+    const bytes = new Uint8Array(ab);
+    const len   = bytes.length;
+    const index = {}; // fname → {method, cmpSize, uncmpSize, dataStart}
+
+    let eocd = -1;
+    for (let i = len - 22; i >= Math.max(0, len - 65536); i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('Bukan file ZIP/XLSX yang valid');
+
+    const cdCount  = dv.getUint16(eocd + 8,  true);
+    const cdOffset = dv.getUint32(eocd + 16, true);
+
+    let pos = cdOffset;
+    for (let n = 0; n < cdCount; n++) {
+      if (pos + 46 > len) break;
+      if (dv.getUint32(pos, true) !== 0x02014b50) break;
+
+      const method    = dv.getUint16(pos + 10, true);
+      const cmpSize   = dv.getUint32(pos + 20, true);
+      const uncmpSize = dv.getUint32(pos + 24, true);
+      const fnLen     = dv.getUint16(pos + 28, true);
+      const exLen     = dv.getUint16(pos + 30, true);
+      const cmtLen    = dv.getUint16(pos + 32, true);
+      const lfhOffset = dv.getUint32(pos + 42, true);
+      const name      = new TextDecoder().decode(bytes.slice(pos + 46, pos + 46 + fnLen));
+      pos += 46 + fnLen + exLen + cmtLen;
+
+      if (lfhOffset + 30 > len) continue;
+      const lfhFnLen  = dv.getUint16(lfhOffset + 26, true);
+      const lfhExLen  = dv.getUint16(lfhOffset + 28, true);
+      const dataStart = lfhOffset + 30 + lfhFnLen + lfhExLen;
+
+      index[name] = { method, cmpSize, uncmpSize, dataStart };
+    }
+    return { index, bytes };
+  }
+
+  // Decompress satu file dari index
+
+async function extractFile(zipData, fname) {
+    const entry = zipData.index[fname];
+    if (!entry) return null;
+    const { method, cmpSize, dataStart } = entry;
+    const { bytes } = zipData;
+    const cmpData = bytes.slice(dataStart, dataStart + cmpSize);
+
+    if (method === 0) return cmpData;
+    if (method !== 8) return null;
+
+    // Coba DecompressionStream (faster untuk file besar)
+    if (typeof DecompressionStream !== 'undefined') {
+      try {
+        const ds  = new DecompressionStream('deflate-raw');
+        const w   = ds.writable.getWriter();
+        const r   = ds.readable.getReader();
+        await w.write(cmpData);
+        await w.close();
+        const chunks = []; let total = 0;
+        while (true) {
+          const { done, value } = await r.read();
+          if (done) break;
+          chunks.push(value); total += value.length;
+        }
+        const out = new Uint8Array(total); let off = 0;
+        for (const ch of chunks) { out.set(ch, off); off += ch.length; }
+        return out;
+      } catch(e) {}
+    }
+    // Fallback tinyInflate
+    try { return tinyInflate(cmpData); } catch(e) { return new Uint8Array(0); }
+  }
 
 
 // === XLSX Reader (embedded) ===
